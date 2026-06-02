@@ -38,12 +38,14 @@ hess_type = 'analytic';
 bs_sophia = 1; 
 
 lr_sophia = 0.001;
-beta1     = 0.965;
-beta2     = 0.99;
-rho       = 0.04;
-wd        = 0.0;
+beta1_sophia = 0.9;
+beta2_sophia = 0.9;
+rho_sophia = 0.01;
 
 lr_adam  = 0.001;
+beta1_adam = 0.9;
+beta2_adam = 0.99;
+
 lr_sgdm  = 1.5 / (2 * max(A_num));   % stable: lr << 2 / max_curvature
 momentum = 0.9;
 
@@ -70,6 +72,7 @@ quadLoss = @(w, A, b) deal( ...
     dlgradient(sum(0.5 .* A .* w.^2 + b .* w), w));
 
 % ── Training loop ─────────────────────────────────────────────────────────────
+k = 0;
 for t = 1:max_iters
 
     % ── 1. Sophia ─────────────────────────────────────────────────────────────
@@ -83,6 +86,7 @@ for t = 1:max_iters
     % giving ratio = |avg_g| / (rho*g^2) which is well-scaled.
     hess_est = [];
     if do_hess
+        k = k + 1;
         switch lower(hess_type)
             case 'gnb'
                 % Gauss-Newton-Bartlett: g * g
@@ -102,15 +106,16 @@ for t = 1:max_iters
     end
 
     [w_sophia, avg_g_sophia, avg_hess_sophia] = sophiaupdate( ...
-        w_sophia, g_s, avg_g_sophia, avg_hess_sophia, hess_est, do_hess, ...
-        t, lr_sophia, beta1, beta2, bs_sophia, rho);
+        w_sophia, g_s, avg_g_sophia, avg_hess_sophia, hess_est, ...
+        do_hess, t, k, lr_sophia, beta1_sophia, beta2_sophia, rho_sophia);
 
     % ── 2. Adam ───────────────────────────────────────────────────────────────
     [L_a, g_a] = dlfeval(quadLoss, w_adam, A_diag, b_vec);
     loss_adam(t) = double(extractdata(L_a));
 
     [w_adam, avg_g_adam, avg_gsq_adam] = adamupdate( ...
-        w_adam, g_a, avg_g_adam, avg_gsq_adam, t, lr_adam, beta1, beta2);
+        w_adam, g_a, avg_g_adam, avg_gsq_adam, t, lr_adam, ...
+        beta1_adam, beta2_adam);
 
     % ── 3. SGD-M via sgdmupdate ───────────────────────────────────────────────
     [L_m, g_m] = dlfeval(quadLoss, w_sgdm, A_diag, b_vec);

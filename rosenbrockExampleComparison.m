@@ -27,7 +27,7 @@ x0 = -1.5;
 y0 = 2.5;
 num_iters = 1000;
 hess_interval = 10;
-hessian_method = 'Analytical'; % 'Analytical', 'Hutchinson' or 'GNB'
+hessian_method = 'Hutchinson'; % 'Analytical', 'Hutchinson' or 'GNB'
 
 % Optimized hyperparameters
 sgdm_lr = 0.001;
@@ -38,14 +38,13 @@ adam_beta1 = 0.9;
 adam_beta2 = 0.999;
 
 sophia_lr = 0.05;
-sophia_beta1 = 0.965;
-sophia_beta2 = 0.99;
-sophia_bs = 1;
+sophia_beta1 = 0.9;
+sophia_beta2 = 0.9;
 sophia_rho = 0.01;
 if strcmpi(hessian_method,'GNB')
-    sophia_rho = sophia_rho/20; % with GNB use 0.01/20
+    sophia_beta2 = 0.99;
+    sophia_rho = 0.0003; 
 end
-sophia_weight_decay = 0;
 
 %% Initialize Optimizer States
 
@@ -70,19 +69,20 @@ history_sophia = params_sophia;
 loss_sophia = rosenbrock(x0, y0);
 
 %% Main Optimization Loop
+iter_hess = 0;
 for iter = 1:num_iters
     
     %% SGDM Update using sgdmupdate()
     grad_sgdm = rosenbrock_grad(params_sgdm(1), params_sgdm(2));
-    [params_sgdm, velocity_sgdm] = sgdmupdate(params_sgdm, grad_sgdm, velocity_sgdm, ...
-        sgdm_lr, sgdm_momentum);
+    [params_sgdm, velocity_sgdm] = sgdmupdate(params_sgdm, grad_sgdm, ...
+        velocity_sgdm, sgdm_lr, sgdm_momentum);
     history_sgdm = [history_sgdm, params_sgdm];
     loss_sgdm = [loss_sgdm, rosenbrock(params_sgdm(1), params_sgdm(2))];
     
     %% Adam Update using adamupdate()
     grad_adam = rosenbrock_grad(params_adam(1), params_adam(2));
-    [params_adam, avg_grad_adam, avg_sq_grad_adam] = adamupdate(params_adam, grad_adam, ...
-        avg_grad_adam, avg_sq_grad_adam, iter, ...
+    [params_adam, avg_grad_adam, avg_sq_grad_adam] = adamupdate( ...
+        params_adam, grad_adam, avg_grad_adam, avg_sq_grad_adam, iter, ...
         adam_lr, adam_beta1, adam_beta2);
     history_adam = [history_adam, params_adam];
     loss_adam = [loss_adam, rosenbrock(params_adam(1), params_adam(2))];
@@ -94,9 +94,10 @@ for iter = 1:num_iters
     hess_estimate = [];
     update_hess_flag = (iter == 1) || (mod(iter, hess_interval) == 0);
     if update_hess_flag
+        iter_hess = iter_hess + 1;
         switch hessian_method
             case 'GNB'
-                hess_estimate = 2.*grad_sophia.*grad_sophia;
+                hess_estimate = grad_sophia.*grad_sophia;
             case 'Hutchinson'
                 epsilon = 1e-4; % Finite difference step size
 
@@ -123,8 +124,8 @@ for iter = 1:num_iters
 
     [params_sophia, avg_grad_sophia, avg_hess_sophia] = sophiaupdate(...
         params_sophia, grad_sophia, avg_grad_sophia, avg_hess_sophia, ...
-        hess_estimate, update_hess_flag, iter, sophia_lr, sophia_beta1, ...
-        sophia_beta2, sophia_bs, sophia_rho, sophia_weight_decay);
+        hess_estimate, update_hess_flag, iter, iter_hess, sophia_lr, ...
+        sophia_beta1, sophia_beta2, sophia_rho);
     
     history_sophia = [history_sophia, params_sophia];
     loss_sophia = [loss_sophia, rosenbrock(params_sophia(1), params_sophia(2))];

@@ -1,13 +1,13 @@
-function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, ...
-    hess_est, update_hess, t, lr, beta1, beta2, bs, rho, weight_decay, epsilon)
+function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, hess_est,...
+    update_hess, t, k, lr, beta1, beta2, rho, bs, weight_decay, epsilon)
 %SOPHIAUPDATE Update parameters via Sophia second-order optimization
 %
 %   [NET,AVG_G,AVG_H] = SOPHIAUPDATE(NET,GRAD,AVG_G,AVG_H,HESS_EST,
-%   HESS_UPDATE_H,ITER) updates the learnable parameters of the dlnetwork
-%   NET using the Sophia (Second-order Clipped Stochastic Optimization with
-%   diagonal Hessian pre-conditioning) algorithm. Sophia improves upon Adam
-%   by adapting step sizes to heterogeneous curvatures using a diagonal
-%   Hessian estimate and per-coordinate clipping.
+%   HESS_UPDATE,ITER,HESS_ITER) updates the learnable parameters of the
+%   dlnetwork NET using the Sophia (Second-order Clipped Stochastic
+%   Optimization with diagonal Hessian pre-conditioning) algorithm. Sophia
+%   improves upon Adam by adapting step sizes to heterogeneous curvatures
+%   using a diagonal Hessian estimate and per-coordinate clipping.
 %
 %   Input GRAD contains the gradients of the loss with respect to each of
 %   the network parameters. Inputs AVG_G and AVG_H contain the moving
@@ -24,12 +24,6 @@ function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, ...
 %   If inputs AVG_G and AVG_H are empty, the function assumes no previous
 %   gradients and executes like the first update in a series of iterations.
 %
-%   Input ITER contains the update iteration number. ITER must be a
-%   positive integer. Use a value of 1 for the first call to SOPHIAUPDATE
-%   and increment by 1 for each successive call in a series of iterations.
-%   The Sophia algorithm uses this value to correct for bias in the moving
-%   averages at the beginning of a set of iterations.
-%
 %   Input HESS contains the diagonal Hessian estimate for the current step.
 %   Two estimation methods are supported:
 %
@@ -42,28 +36,36 @@ function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, ...
 %     Draw u ~ N(0,I), compute the Hessian-vector product H*u via a second
 %     backward pass, then pass (u .* Hu) as HESS.
 %
-%   Pass [] (or zeros) when UPDATE_H is false; the stored AVG_H from the
+%   Pass [] (or zeros) when HESS_UPDATE is false; the stored AVG_H from the
 %   previous estimation step will be reused.
 %
-%   Input UPDATE_H is a logical flag. Set UPDATE_H to TRUE on Hessian
+%   Input HESS_UPDATE is a logical flag. Set HESS_UPDATE to TRUE on Hessian
 %   estimation steps (every k iterations, e.g. k=10), FALSE otherwise.
+%
+%   Input ITER contains the update iteration number. ITER must be a
+%   positive integer. Use a value of 1 for the first call to SOPHIAUPDATE
+%   and increment by 1 for each successive call in a series of iterations.
+%   The Sophia algorithm uses this value to correct for bias in the moving
+%   averages at the beginning of a set of iterations.
+%
+%   Input HESS_ITER contains the update iteration number of the Hessian.
 %
 %   Outputs NET, AVG_G, and AVG_H are the updated dlnetwork, average
 %   gradients, and average Hessian estimates, respectively.
 %
 %   [PARAMS,AVG_G,AVG_H] = SOPHIAUPDATE(PARAMS,GRAD,AVG_G,AVG_H,HESS,
-%   UPDATE_H,ITER) updates the deep learning parameters in PARAMS using the
-%   Sophia algorithm. Input PARAMS can be a dlarray, a numeric array, a
-%   cell array, a structure, or a table with a Value variable containing
-%   the learnable parameters of the network. GRAD, AVG_G, and AVG_H must
-%   have the same datatype and ordering as PARAMS. Input GRAD can be
-%   obtained using the dlgradient and dlfeval functions. All parameter
-%   values are updated using the global learning rate.
+%   HESS_UPDATE,ITER,HESS_ITER) updates the deep learning parameters in
+%   PARAMS using the Sophia algorithm. Input PARAMS can be a dlarray, a
+%   numeric array, a cell array, a structure, or a table with a Value
+%   variable containing the learnable parameters of the network. GRAD,
+%   AVG_G, and AVG_H must have the same datatype and ordering as PARAMS.
+%   Input GRAD can be obtained using the dlgradient and dlfeval functions.
+%   All parameter values are updated using the global learning rate.
 %
 %   Outputs PARAMS, AVG_G, and AVG_H are the updated parameters, average
 %   gradients, and average Hessian estimates, respectively.
 %
-%   [___] = SOPHIAUPDATE(___,LEARNRATE,BETA1,BETA2,BATCHSIZE,RHO,
+%   [___] = SOPHIAUPDATE(___,LEARNRATE,BETA1,BETA2,RHO,BATCHSIZE,
 %   WEIGHT_DECAY) also specifies values to use for the global learning
 %   rate, gradient EMA decay factor, Hessian EMA decay factor, effective
 %   batch size in tokens, per-coordinate clipping threshold, and decoupled
@@ -71,19 +73,19 @@ function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, ...
 %   and RHO must be scalars between 0 and 1. BATCHSIZE and WEIGHT_DECAY
 %   must be positive scalars.
 %
-%   [___] = SOPHIAUPDATE(___,LEARNRATE,BETA1,BETA2,BATCHSIZE,RHO,
+%   [___] = SOPHIAUPDATE(___,LEARNRATE,BETA1,BETA2,RHO,BATCHSIZE,
 %   WEIGHT_DECAY,EPSILON) specifies a small constant used to prevent
 %   division by zero in the update equation. The default value of EPSILON
 %   is 1e-15.
 %
 %   Default values:
-%     LEARNRATE    = 3e-4
-%     BETA1        = 0.965  (gradient EMA decay)
+%     LEARNRATE    = 1e-4
+%     BETA1        = 0.9    (gradient EMA decay)
 %     BETA2        = 0.99   (Hessian EMA decay)
+%     RHO          = 0.01   (clipping threshold)
 %     BATCHSIZE    = 1      (tokens per update)
-%     RHO          = 0.04   (clipping threshold)
 %     WEIGHT_DECAY = 0.0    (decoupled weight decay)
-%     EPSILON      = 1e-8   (numerical stability)
+%     EPSILON      = 1e-12  (numerical stability)
 %
 %   Example:
 %      % Perform Sophia updates with Hessian estimation every 10 steps.
@@ -124,13 +126,14 @@ arguments
     hess_est
     update_hess  (1,1) logical
     t            (1,1) {mustBeNumeric, mustBePositive, mustBeInteger}
-    lr           (1,1) {mustBeNumeric, mustBeFinite, mustBeNonnegative} = 3e-4;
-    beta1        (1,1) {mustBeNumeric, mustBeGreaterThanOrEqual(beta1,0), mustBeLessThan(beta1,1)} = 0.965;
+    k            (1,1) {mustBeNumeric, mustBePositive, mustBeInteger} = t
+    lr           (1,1) {mustBeNumeric, mustBeFinite, mustBeNonnegative} = 1e-4;
+    beta1        (1,1) {mustBeNumeric, mustBeGreaterThanOrEqual(beta1,0), mustBeLessThan(beta1,1)} = 0.9;
     beta2        (1,1) {mustBeNumeric, mustBeGreaterThanOrEqual(beta2,0), mustBeLessThan(beta2,1)} = 0.99;
+    rho          (1,1) {mustBeNumeric, mustBePositive} = 0.01;
     bs           (1,1) {mustBeNumeric, mustBePositive} = 1;
-    rho          (1,1) {mustBeNumeric, mustBePositive} = 0.04;
-    weight_decay (1,1) {mustBeNumeric, mustBeFinite, mustBeNonnegative} = 0.8;
-    epsilon      (1,1) {mustBeNumeric, mustBeFinite, mustBePositive} = 1e-8;
+    weight_decay (1,1) {mustBeNumeric, mustBeFinite, mustBeNonnegative} = 0.0;
+    epsilon      (1,1) {mustBeNumeric, mustBeFinite, mustBePositive} = 1e-12;
 end
 
 % Ensure inputs are dlarray where necessary
@@ -164,7 +167,7 @@ end
 
 % All four inputs are now guaranteed to be containers of the same structure
 paramArgs = {g, matlab.lang.internal.move(avg_g), matlab.lang.internal.move(avg_hess), hess_est};
-fixedArgs = {update_hess, t, lr, beta1, beta2, rho, bs, weight_decay, epsilon};
+fixedArgs = {update_hess, t, k, lr, beta1, beta2, rho, bs, weight_decay, epsilon};
 
 % Apply update over network/structure
 [p, ~, avg_g, avg_hess, ~] = deep.internal.networkContainerFixedArgsFun( ...
@@ -173,7 +176,7 @@ fixedArgs = {update_hess, t, lr, beta1, beta2, rho, bs, weight_decay, epsilon};
 end
 
 function [p, g, avg_g, avg_hess, hess_est] = iSingleStepParameter(p, g, avg_g, avg_hess, ...
-    hess_est, update_hess, t, lr, beta1, beta2, rho, bs, weight_decay, epsilon)
+    hess_est, update_hess, t, k, lr, beta1, beta2, rho, bs, weight_decay, epsilon)
 % Update logic for dlnetwork parameters (Learnables table)
 
 % Apply per-parameter learn-rate factor
@@ -184,7 +187,7 @@ p.Value = p.Value .* (1 - lr * weight_decay);
 
 % Apply a correction factor due to the trailing averages being biased
 % towards zero at the beginning.  This is fed into the clipping threshold.
-biasCorrection = (1-beta1.^t)./(1-beta2.^t);
+biasCorrection = (1-beta1.^t)./(1-beta2.^k);
 effectiveRho = biasCorrection.*rho;
 
 v = p.Value;
@@ -195,7 +198,7 @@ p.Value = v;
 end
 
 function [p, g, avg_g, avg_hess, hess_est] = iSingleStepValue(p, g, avg_g, avg_hess, ...
-    hess_est, update_hess, t, lr, beta1, beta2, rho, bs, weight_decay, epsilon)
+    hess_est, update_hess, t, k, lr, beta1, beta2, rho, bs, weight_decay, epsilon)
 % Update logic for raw dlarrays or numeric arrays
 
 % Apply Weight Decay using base LR
@@ -203,7 +206,7 @@ p = p .* (1 - lr * weight_decay);
 
 % Apply a correction factor due to the trailing averages being biased
 % towards zero at the beginning.  This is fed into the clipping threshold.
-biasCorrection = (1-beta1.^t)./(1-beta2.^t);
+biasCorrection = (1-beta1.^t)./(1-beta2.^k);
 effectiveRho = biasCorrection.*rho;
 
 [p, avg_g, avg_hess] = internal_sophia(p, g, avg_g, avg_hess, hess_est, ...

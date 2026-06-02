@@ -43,8 +43,19 @@ bs = miniBatchSize * 28 * 28;
 
 %% 4. Training Loop
 iteration = 0;
+iteration_hessian = 0;
 lossAdamLog = [];
 lossSophiaLog = [];
+
+% Check GPU availability and select device
+gpuDevice;
+useGPU = gpuDeviceCount > 0;
+
+% Transfer data to GPU if available
+if useGPU
+    XTrain = gpuArray(XTrain);
+    YTrain = gpuArray(single(YTrain));
+end
 
 figure;
 lineAdam = animatedline('Color', 'r', 'LineWidth', 1.5);
@@ -76,7 +87,9 @@ for epoch = 1:numEpochs
         % 2. Hessian Estimation (GNB Sampling)
         doHess = (mod(iteration, hessInterval) == 0) || (iteration == 1);
         hessEst = [];
-        if doHess          
+        if doHess      
+            iteration_hessian = iteration_hessian + 1; 
+
             if strcmp(hessMethod, 'GNB')
                 % Option 1: GNB Sampling (Sample labels from model distribution)
                 logits = predict(netSophia, X);
@@ -94,7 +107,7 @@ for epoch = 1:numEpochs
         end
         
         [netSophia, avgG_S, avgH_S] = sophiaupdate(netSophia, gradS, avgG_S, avgH_S, ...
-            hessEst, doHess, iteration, lrSophia, 0.965, 0.99, bs);
+            hessEst, doHess, iteration, iteration_hessian, lrSophia,0.9,0.99,0.01,bs);
         
         % Logging
         addpoints(lineAdam, iteration, double(extractdata(lossA)));

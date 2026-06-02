@@ -108,7 +108,7 @@ learnRate = 0.001;
 gradientDecayFactor = 0.965;
 hessianDecayFactor = 0.99;
 batchSize = miniBatchSize;
-rho = 0.04;
+clippingThreshold = 0.04;
 hessianEstimateFreq = 10;
 
 % Train using gradually decaying values
@@ -165,6 +165,7 @@ epsilon = linspace(epsilonStart,epsilonEnd,numIterations);
 
 % Loop over epochs.
 iteration = 0;
+iteration_hessian = 0;
 start = tic;
 lossMin = inf;
 reset(mbq)
@@ -185,8 +186,9 @@ for epoch = 1:numEpochs
         % Compute loss and gradients.
         hessEstEncoder = [];
         hessEstDecoder = [];
-        doHessian = (mod(iteration, hessianEstimateFreq) == 0);
+        doHessian = (iteration == 1) || (mod(iteration, hessianEstimateFreq) == 0);
         if doHessian
+            iteration_hessian = iteration_hessian + 1;
             % With GNB sampling
             [loss,gradientsEncoder,gradientsDecoder,hessEstEncoder,...
                 hessEstDecoder,YPred] = dlfeval(@modelLossWithHessian,...
@@ -204,12 +206,14 @@ for epoch = 1:numEpochs
         [netEncoder, trailingAvgGencoder, trailingAvgHencoder] = sophiaupdate(...
             netEncoder, gradientsEncoder, trailingAvgGencoder, ...
             trailingAvgHencoder, hessEstEncoder, doHessian, iteration, ...
-            learnRate, gradientDecayFactor, hessianDecayFactor, numTokens, rho);
+            iteration_hessian, learnRate, gradientDecayFactor, ...
+            hessianDecayFactor, clippingThreshold, numTokens);
 
         [netDecoder, trailingAvgGdecoder, trailingAvgHdecoder] = sophiaupdate(...
             netDecoder, gradientsDecoder, trailingAvgGdecoder, ...
             trailingAvgHdecoder, hessEstDecoder, doHessian, iteration, ...
-            learnRate, gradientDecayFactor, hessianDecayFactor, numTokens, rho);
+            iteration_hessian, learnRate, gradientDecayFactor, ...
+            hessianDecayFactor, clippingThreshold, numTokens);
 
        
         if iteration == 1 || mod(iteration,10) == 0
