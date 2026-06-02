@@ -30,18 +30,20 @@ L_star = 0.5 * sum(A_num .* w_star.^2) + sum(b_num .* w_star);
 max_iters     = 1000;
 hess_interval = 10;
 
+% Options: 'gnb' (g^2), 'analytic' (exact A), 'hutchinson' (u'*H*u)
+hess_type = 'analytic'; 
+
 % bs=1: removes LLM token-count scaling so that rho*bs*avg_hess ~ rho*g^2,
 % keeping the clipping ratio in a healthy [0,1] range for this problem.
 bs_sophia = 1; 
 
-lr_sophia = 3e-2;
+lr_sophia = 0.001;
 beta1     = 0.965;
 beta2     = 0.99;
 rho       = 0.04;
 wd        = 0.0;
-epsilon   = 1e-15;
 
-lr_adam  = 2e-3;
+lr_adam  = 0.001;
 lr_sgdm  = 1.5 / (2 * max(A_num));   % stable: lr << 2 / max_curvature
 momentum = 0.9;
 
@@ -81,19 +83,34 @@ for t = 1:max_iters
     % giving ratio = |avg_g| / (rho*g^2) which is well-scaled.
     hess_est = [];
     if do_hess
-        hess_est = g_s .* g_s;
+        switch lower(hess_type)
+            case 'gnb'
+                % Gauss-Newton-Bartlett: g * g
+                hess_est = g_s .* g_s;
+                
+            case 'analytic'
+                % Exact Hessian for this quadratic problem is A_diag
+                hess_est = A_diag;
+                
+            case 'hutchinson'
+                % Hutchinson: u .* (H*u) where u ~ N(0,1)
+                u = dlarray(randn(d, 1), 'CB');
+                % For this quadratic, H*u is simply A_diag .* u
+                Hu = A_diag .* u; 
+                hess_est = max(u .* Hu,0);
+        end
     end
 
     [w_sophia, avg_g_sophia, avg_hess_sophia] = sophiaupdate( ...
         w_sophia, g_s, avg_g_sophia, avg_hess_sophia, hess_est, do_hess, ...
-        t, lr_sophia, beta1, beta2, bs_sophia, rho, wd, epsilon);
+        t, lr_sophia, beta1, beta2, bs_sophia, rho);
 
     % ── 2. Adam ───────────────────────────────────────────────────────────────
     [L_a, g_a] = dlfeval(quadLoss, w_adam, A_diag, b_vec);
     loss_adam(t) = double(extractdata(L_a));
 
     [w_adam, avg_g_adam, avg_gsq_adam] = adamupdate( ...
-        w_adam, g_a, avg_g_adam, avg_gsq_adam, t, lr_adam, beta1, beta2, epsilon);
+        w_adam, g_a, avg_g_adam, avg_gsq_adam, t, lr_adam, beta1, beta2);
 
     % ── 3. SGD-M via sgdmupdate ───────────────────────────────────────────────
     [L_m, g_m] = dlfeval(quadLoss, w_sgdm, A_diag, b_vec);

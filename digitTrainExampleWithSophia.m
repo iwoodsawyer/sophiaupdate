@@ -33,8 +33,9 @@ avgG_A = [];
 avgSq_A = [];
 
 % Sophia Params
-lrSophia = 3e-3; % Sophia can typically handle a 3-5x higher LR
+lrSophia = 1e-3;
 hessInterval = 10;
+hessMethod = 'GNB';   % Toggle between 'GNB' and 'Hutchinson'
 avgG_S = [];
 avgH_S = [];
 % bs = tokens per batch. For images, we use TotalPixels
@@ -75,14 +76,21 @@ for epoch = 1:numEpochs
         % 2. Hessian Estimation (GNB Sampling)
         doHess = (mod(iteration, hessInterval) == 0) || (iteration == 1);
         hessEst = [];
-        if doHess
-            % Second forward pass to sample labels from model distribution
-            logits = predict(netSophia, X);
-            Y_sampled = sampleCategorical(logits);
-            [~, gradSampled] = dlfeval(@modelLoss, netSophia, X, Y_sampled);
-            
-            % GNB: bs * g_sampled^2
-            hessEst = dlupdate(@(g) bs .* (g.^2), gradSampled);
+        if doHess          
+            if strcmp(hessMethod, 'GNB')
+                % Option 1: GNB Sampling (Sample labels from model distribution)
+                logits = predict(netSophia, X);
+                Y_sampled = sampleCategorical(logits);
+                [~, gradSampled] = dlfeval(@modelLoss, netSophia, X, Y_sampled);
+                hessEst = dlupdate(@(g) g.*g, gradSampled);
+            else
+                % Option 2: Hutchinson Estimator (Hessian-vector product)
+                u = dlupdate(@(x) randn(size(x), 'like', x), gradS);
+                % Compute Hessian-vector product H*u
+                hvp = dlfeval(@computeHVP, netSophia, X, Y, u);
+                % Hutchinson diagonal estimate: u .* (H*u)
+                hessEst = dlupdate(@(a,b) max(a.*b, 0), u, hvp);
+            end
         end
         
         [netSophia, avgG_S, avgH_S] = sophiaupdate(netSophia, gradS, avgG_S, avgH_S, ...
@@ -100,6 +108,26 @@ function [loss, gradients] = modelLoss(net, X, Y)
     probs = forward(net, X);
     loss = crossentropy(probs, Y);
     gradients = dlgradient(loss, net.Learnables);
+end
+
+function hvp = computeHVP(net, X, Y, v)
+    % Forward pass and first gradient
+    probs = forward(net, X);
+    loss = crossentropy(probs, Y);
+    grad = dlgradient(loss, net.Learnables, 'RetainData', true);
+    
+    % Differentiable dot product: sum over all learnables of grad .* v
+    gvTable = dlupdate(@(g, vi) sum(g .* vi, 'all'), grad, v);
+    
+    % Sum the per-parameter scalars into a single scalar dlarray
+    vals = gvTable.Value;
+    gv = vals{1};
+    for k = 2:numel(vals)
+        gv = gv + vals{k};
+    end
+    
+    % Second gradient gives H*v
+    hvp = dlgradient(gv, net.Learnables);
 end
 
 function Y_sampled = sampleCategorical(logits)

@@ -10,6 +10,14 @@
 % 4. Training loop passes numTokens to sophiaupdate, not miniBatchSize
 %
 
+% Detect execution environment
+executionEnvironment = "auto";
+if (executionEnvironment == "auto" && canUseGPU) || executionEnvironment == "gpu"
+    env = "gpu";
+else
+    env = "cpu";
+end
+
 %% Load Training Data
 
 % Download and extract the English-German Tab-delimited Bilingual Sentence Pairs data set.
@@ -88,7 +96,8 @@ netDecoder = dlnetwork(lgraphDecoder);
 netDecoder.OutputNames = ["softmax" "context" "lstm2/hidden" "lstm2/cell"];
 
 
-%% Specify Training Options with CORRECTED SOPHIA Settings
+
+%% Specify Training Options with SOPHIA Settings
 
 % Initialize mini-batch size, epochs and learning rate
 miniBatchSize = 64;
@@ -113,7 +122,7 @@ documentsGerman = documentsGerman(idx);
 documentsEnglish = documentsEnglish(idx);
 
 
-%% Train Model with CORRECTED SOPHIA Optimizer
+%% Train Model with SOPHIA Optimizer
 % Train the model using a custom training loop.
 % Key changes in this section:
 % 1. modelLossWithHessian now takes miniBatchSize and sequenceLength
@@ -126,11 +135,13 @@ adsTarget = arrayDatastore(documentsEnglish);
 cds = combine(adsSource,adsTarget);
 
 % Create a mini-batch queue to automatically prepare mini-batches for training.
-mbq = minibatchqueue(cds,4, ...
-    MiniBatchSize=miniBatchSize, ...
-    MiniBatchFcn=@(X,Y) preprocessMiniBatch(X,Y,encGerman,encEnglish), ...
-    MiniBatchFormat=["CTB" "CTB" "CTB" "CTB"], ...
-    PartialMiniBatch="discard");
+mbq = minibatchqueue(cds, 4, ...
+    "OutputEnvironment", env, ... % Move data to GPU automatically
+    "OutputCast","single",...
+    "MiniBatchSize", miniBatchSize, ...
+    "MiniBatchFcn", @(X,Y) preprocessMiniBatch(X,Y,encGerman,encEnglish), ...
+    "MiniBatchFormat", ["CTB" "CTB" "CTB" "CTB"], ...
+    "PartialMiniBatch", "discard");
 
 % Initialize the training progress plot.
 figure
@@ -167,7 +178,7 @@ for epoch = 1:numEpochs
         % Read mini-batch of data.
         [X,T,maskT,decoderInput] = next(mbq);
 
-        % CORRECTED: Compute total token count for proper Hessian scaling
+        % Compute total token count for proper Hessian scaling
         [~, miniBatchSize_actual, sequenceLength_actual] = size(X);
         numTokens = miniBatchSize_actual * sequenceLength_actual;
 
@@ -200,38 +211,39 @@ for epoch = 1:numEpochs
             trailingAvgHdecoder, hessEstDecoder, doHessian, iteration, ...
             learnRate, gradientDecayFactor, hessianDecayFactor, numTokens, rho);
 
-        % Generate translation for plot.
+       
         if iteration == 1 || mod(iteration,10) == 0
+             % Generate translation for plot.
             strGerman = ind2str(X(:,1,:),encGerman);
             strEnglish = ind2str(T(:,1,:),encEnglish,Mask=maskT);
             strTranslated = ind2str(YPred(:,1,:),encEnglish);
-        end
+        
+            % Display training progress.
+            D = duration(0,0,toc(start),Format="hh:mm:ss");
+            loss = single(gather(extractdata(loss)));
+            addpoints(lineLossTrain,iteration,loss)
 
-        % Display training progress.
-        D = duration(0,0,toc(start),Format="hh:mm:ss");
-        loss = double(gather(extractdata(loss)));
-        addpoints(lineLossTrain,iteration,loss)
+            hessianMarker = "";
+            if doHessian
+                hessianMarker = " [Hessian Est. - GNB]";
+            end
+            title( ...
+                "Epoch: " + epoch + ", Iteration: " + iteration + ...
+                ", Elapsed: " + string(D) + hessianMarker + newline + ...
+                "Source: " + strGerman + newline + ...
+                "Target: " + strEnglish + newline + ...
+                "Training Translation: " + strTranslated)
+            drawnow limitrate
 
-        hessianMarker = "";
-        if doHessian
-            hessianMarker = " [Hessian Est. - GNB]";
-        end
-        title( ...
-            "Epoch: " + epoch + ", Iteration: " + iteration + ...
-            ", Elapsed: " + string(D) + hessianMarker + newline + ...
-            "Source: " + strGerman + newline + ...
-            "Target: " + strEnglish + newline + ...
-            "Training Translation: " + strTranslated)
-        drawnow
-
-        % Save best network.
-        if loss < lossMin
-            lossMin = loss;
-            netBest.netEncoder = netEncoder;
-            netBest.netDecoder = netDecoder;
-            netBest.loss = loss;
-            netBest.iteration = iteration;
-            netBest.D = D;
+            % Save best network.
+            if loss < lossMin
+                lossMin = loss;
+                netBest.netEncoder = netEncoder;
+                netBest.netDecoder = netDecoder;
+                netBest.loss = loss;
+                netBest.iteration = iteration;
+                netBest.D = D;
+            end
         end
     end
 
@@ -476,65 +488,35 @@ end
 
 %% Helper Functions
 
-%%% Sample Targets from Predictions (GNB Method)
+%%% Sample Targets from Predictions (Vectorized & GPU Compatible)
 function [T_sampled, mask] = sampleTargetsFromPredictions(Y, maskT)
 
-[numClasses, miniBatchSize, sequenceLength] = size(Y);
+% Extract raw data (numeric or gpuArray) from dlarray
+% This is necessary because cumsum/sampling are not differentiable
+Y_data = extractdata(Y);
 
-% Manual softmax computation for numerical stability
-% probs = exp(Y) / sum(exp(Y)) along class dimension
-Y_shifted = Y - max(Y, [], 1);  % Subtract max for stability
-exp_Y = exp(Y_shifted);
-probs = exp_Y ./ sum(exp_Y, 1);  % Normalize along class dimension (dim 1)
+% 1. Vectorized Softmax on raw data
+Y_shifted = Y_data - max(Y_data, [], 1);
+probs = exp(Y_shifted) ./ sum(exp(Y_shifted), 1);
 
-T_sampled = zeros(1, miniBatchSize, sequenceLength, 'like', Y);
+[numClasses, miniBatchSize, sequenceLength] = size(probs);
+
+% 2. Vectorized Categorical Sampling
+% Calculate cumulative probabilities along the class dimension (dim 1)
+cumsum_p = cumsum(probs, 1);
+
+% Generate random thresholds
+r = rand(1, miniBatchSize, sequenceLength, "like", probs);
+
+% Find the first index where cumsum_p >= r
+% In vectorized form: count how many classes are < r and add 1
+T_sampled = sum(cumsum_p < r, 1) + 1;
+
+% 3. Boundary Check (ensure indices are within 1 to numClasses)
+T_sampled = min(T_sampled, numClasses);
+
 mask = maskT;
-
-% Sample for each position in the batch
-for b = 1:miniBatchSize
-    for t = 1:sequenceLength
-        if maskT(1, b, t) > 0
-            % Extract probability vector for this position
-            p = extractdata(gather(probs(:, b, t)));
-            p = p / sum(p);  % Ensure normalized
-
-            % Categorical sampling using cumulative sum
-            cumsum_p = cumsum(p);
-            r = rand();
-            idx = find(cumsum_p >= r, 1, 'first');
-            if isempty(idx)
-                idx = numClasses;
-            end
-
-            T_sampled(1, b, t) = idx;
-        end
-    end
-end
-
-T_sampled = dlarray(T_sampled, 'CBT');
-end
-
-%%% GNB Hessian Estimation
-function hessian = estimateHessianDiagonal_GNB(gradientTable)
-
-numLearnables = height(gradientTable);
-hessian = table;
-hessian.Value = cell(numLearnables, 1);
-
-for i = 1:numLearnables
-    grad_sampled = gradientTable.Value{i};
-    hessian.Value{i} = grad_sampled.^2;
-end
-end
-
-%%% Scale Hessian by Token Count
-function hessian = scaleHessianByTokenCount(hessian, numTokens)
-
-numLearnables = height(hessian);
-
-for i = 1:numLearnables
-    hessian.Value{i} = hessian.Value{i} * numTokens;
-end
+% Note: T_sampled is returned as a numeric/gpuArray for use as indices
 end
 
 
@@ -555,34 +537,24 @@ loss = sparseCrossEntropy(Y, T, maskT);
 [gradientsE, gradientsD] = dlgradient(loss, ...
     netEncoder.Learnables, netDecoder.Learnables);
 
-sequenceLength_actual = size(T, 3);
-loss = loss ./ sequenceLength_actual;
-
-% Step 1: Sample labels from network predictions (CRITICAL!)
+% Step 1: Sample labels from network predictions
 [T_sampled_raw, mask_sampled] = sampleTargetsFromPredictions(Y, maskT);
 
-% Convert to dlarray format compatible with sparseCrossEntropy
-T_sampled = dlarray(T_sampled_raw, 'CBT');
-
-% Step 2: Compute SAMPLED loss (different from training loss!)
+% Step 2: Compute SAMPLED loss (different from training loss)
 loss_sampled = sparseCrossEntropy_GNB(Y, T_sampled_raw, mask_sampled);
 
-% Step 3: Compute gradients w.r.t. SAMPLED loss (not actual loss!)
+% Step 3: Compute gradients w.r.t. SAMPLED loss (not actual loss)
 [gradients_sampled_E, gradients_sampled_D] = dlgradient(...
     loss_sampled, netEncoder.Learnables, netDecoder.Learnables);
 
 % Step 4: Estimate Hessian from sampled gradients (GNB formula)
-hessianE = estimateHessianDiagonal_GNB(gradients_sampled_E);
-hessianD = estimateHessianDiagonal_GNB(gradients_sampled_D);
-
-% Step 5: CRITICAL - Scale Hessian by total token count
-numTokens = miniBatchSize * sequenceLength_actual;
-hessianE = scaleHessianByTokenCount(hessianE, numTokens);
-hessianD = scaleHessianByTokenCount(hessianD, numTokens);
+hessianE = dlupdate(@(g) g.^2, gradients_sampled_E);
+hessianD = dlupdate(@(g) g.^2, gradients_sampled_D);
 
 % Decode predictions for visualization
 YPred = onehotdecode(Y, 1:size(Y,1), 1, "single");
 end
+
 
 %%% Model Loss Function
 % The modelLoss function takes as input the encoder network, decoder
@@ -609,13 +581,8 @@ loss = sparseCrossEntropy(Y,T,maskT);
 [gradientsE,gradientsD] = dlgradient(loss,netEncoder.Learnables,...
     netDecoder.Learnables);
 
-% For plotting, return loss normalized by sequence length.
-sequenceLength = size(T,3);
-loss = loss ./ sequenceLength;
-
 % For plotting example translations, return the decoder output.
 YPred = onehotdecode(Y,1:size(Y,1),1,"single");
-
 end
 
 %%% Decoder Predictions Function
@@ -646,9 +613,9 @@ Y = dlarray(Y,"CBT");
 
 % Loop over remaining time steps.
 for t = 2:sequenceLength
+    % Scheduled sampling. 
 
-    % Scheduled sampling. Randomly select previous target or previous
-    % prediction.
+    % Randomly select previous target or previous prediction.
     if rand < epsilon
         % Use target value.
         decoderInput = T(:,:,t-1);
@@ -662,60 +629,58 @@ for t = 2:sequenceLength
     [Y(:,:,t),context,hiddenState,cellState] = forward(netDecoder,...
         decoderInput,hiddenState,cellState,context,Z);
 end
-
 end
 
-%%% Sparse Cross-Entropy Loss for GNB (Vectorized)
-% GNB version using vectorized operations to avoid indexing issues
-% Y: [numClasses, miniBatchSize, sequenceLength] - logits
-% T_sampled_indices: [1, miniBatchSize, sequenceLength] - sampled class indices
-% maskT: [1, miniBatchSize, sequenceLength] - mask for valid positions
+%%% Sparse Cross-Entropy Loss for GNB (Vectorized & GPU Compatible)
 function loss = sparseCrossEntropy_GNB(Y, T_sampled_indices, maskT)
+% Y: [numClasses, miniBatchSize, sequenceLength]
+% T_sampled_indices: [1, miniBatchSize, sequenceLength]
+% maskT: [1, miniBatchSize, sequenceLength]
 
 [numClasses, miniBatchSize, sequenceLength] = size(Y);
 
-% Ensure numerical stability
-precision = underlyingType(Y);
-Y_safe = Y + eps(precision);
-
-% Extract indices as regular integers
-T_extracted = extractdata(gather(T_sampled_indices));
-T_extracted = uint32(T_extracted);
-mask_extracted = extractdata(gather(maskT));
-mask_extracted = squeeze(mask_extracted);
-
-% Initialize loss array
-loss_array = zeros(miniBatchSize, sequenceLength, 'like', Y);
-
-% Process each element
-for n = 1:miniBatchSize
-    for t = 1:sequenceLength
-        if mask_extracted(n, t) > 0
-            idx = T_extracted(1, n, t);
-            % Clip to valid range
-            idx = max(1, min(idx, numClasses));
-
-            % Get logits for this position
-            logits_pos = Y_safe(:, n, t);
-
-            % Compute log-sum-exp for numerical stability
-            logits_shifted = logits_pos - max(logits_pos);
-            log_sum_exp = max(logits_pos) + log(sum(exp(logits_shifted)));
-
-            % Compute log probability
-            logit_val = logits_pos(idx);
-            log_prob = logit_val - log_sum_exp;
-
-            % Cross-entropy loss
-            loss_array(n, t) = -log_prob;
-        end
-    end
+% 1. Robustly extract indices and mask data
+% We need raw numeric/gpuArray values for indexing logic
+if isdlarray(T_sampled_indices)
+    T_data = extractdata(T_sampled_indices);
+else
+    T_data = T_sampled_indices;
+end
+if isdlarray(maskT)
+    mask_data = extractdata(maskT);
+else
+    mask_data = maskT;
 end
 
-% Apply mask and aggregate
-loss_array = loss_array .* reshape(mask_extracted, miniBatchSize, sequenceLength);
-loss = sum(loss_array, "all") / miniBatchSize;
+% 2. Numerical Stability: Compute Log-Sum-Exp (keep as dlarray)
+maxY = max(Y, [], 1);
+logSumExp = maxY + log(sum(exp(Y - maxY), 1));
+
+% 3. Extract Logits for Sampled Classes using Linear Indexing
+T_flat = reshape(T_data, 1, []);
+numElements = miniBatchSize * sequenceLength;
+
+% Calculate linear offsets to jump to the correct batch/time-step column
+offsets = cast((0:numElements-1) * numClasses, 'uint32');
+if isa(Y, 'gpuArray')
+    offsets = gpuArray(offsets);
 end
+linearIdx = uint32(T_flat) + offsets;
+
+% Flatten Y and extract specific logits (preserves dlarray gradients)
+Y_flat = reshape(Y, [], 1);
+sampledLogits = Y_flat(linearIdx);
+sampledLogits = reshape(sampledLogits, 1, miniBatchSize, sequenceLength);
+
+% 4. Compute Negative Log Likelihood: -(logit - logSumExp)
+loss_all = logSumExp - sampledLogits;
+
+% 4. Apply Mask and Average
+loss_all = loss_all .* mask_data;
+numValidTokens = sum(mask_data, "all");
+loss = sum(loss_all, "all") / numValidTokens;
+end
+
 
 %%% Sparse Cross-Entropy Loss
 % The sparseCrossEntropy function calculates the cross-entropy loss between
@@ -723,31 +688,26 @@ end
 % array of probabilities and T is encoded as a sequence of integer values.
 
 function loss = sparseCrossEntropy(Y,T,maskT)
-
-% Initialize loss.
-[~,miniBatchSize,sequenceLength] = size(Y);
-loss = zeros([miniBatchSize sequenceLength],"like",Y);
+[numClasses, miniBatchSize, sequenceLength] = size(Y);
 
 % To prevent calculating log of 0, bound away from zero.
 precision = underlyingType(Y);
-Y(Y < eps(precision)) = eps(precision);
+Y = max(Y, eps(precision));
 
-% Loop over time steps.
-for n = 1:miniBatchSize
-    for t = 1:sequenceLength
-        idx = T(1,n,t);
-        loss(n,t) = -log(Y(idx,n,t));
-    end
-end
+% Vectorized indexing: Extract the logit corresponding to the target class
+% Y is [numClasses, miniBatchSize, seqLen], T is [1, miniBatchSize, seqLen]
+T_indices = reshape(extractdata(T), 1, []);
+offsets = (0:miniBatchSize*sequenceLength-1) * numClasses;
+linearIndices = uint32(T_indices + offsets);
 
-% Apply masking.
-maskT = squeeze(maskT);
-loss = loss .* maskT;
+Y_flat = reshape(Y, [], 1);
+loss = -log(Y_flat(linearIndices));
 
-% Calculate sum and normalize.
-loss = sum(loss,"all");
-loss = loss / miniBatchSize;
-
+% Reshape and apply mask
+loss = reshape(loss, miniBatchSize, sequenceLength);
+loss = loss .* squeeze(maskT);
+numValidTokens = sum(maskT, 'all');
+loss = sum(loss, 'all') / numValidTokens;
 end
 
 %%% Text Preprocessing Function
@@ -769,7 +729,6 @@ stopToken = args.StopToken;
 str = lower(str);
 str = startToken + str + stopToken;
 documents = tokenizedDocument(str,CustomTokens=[startToken stopToken]);
-
 end
 
 %%% Mini-Batch Preprocessing Function
@@ -792,7 +751,6 @@ sequencesTarget = doc2sequence(encEnglish,documentsEnglish,...
 decoderInput = XTarget(:,1,:);
 XTarget(:,1,:) = [];
 mask(:,1,:) = [];
-
 end
 
 %%% Predictors Preprocessing Function
@@ -805,5 +763,4 @@ function XSource = preprocessPredictors(documentsGerman,encGerman)
 sequencesSource = doc2sequence(encGerman,documentsGerman,...
     PaddingDirection="none");
 XSource = padsequences(sequencesSource,2);
-
 end

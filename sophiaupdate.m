@@ -2,12 +2,12 @@ function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, ...
     hess_est, update_hess, t, lr, beta1, beta2, bs, rho, weight_decay, epsilon)
 %SOPHIAUPDATE Update parameters via Sophia second-order optimization
 %
-%   [NET,AVG_G,AVG_H] = SOPHIAUPDATE(NET,GRAD,AVG_G,AVG_H,HESS,UPDATE_H,ITER)
-%   updates the learnable parameters of the dlnetwork NET using the Sophia
-%   (Second-order Clipped Stochastic Optimization with diagonal Hessian 
-%   pre-conditioning) algorithm. Sophia improves upon Adam by adapting step 
-%   sizes to heterogeneous curvatures using a diagonal Hessian estimate and 
-%   per-coordinate clipping.
+%   [NET,AVG_G,AVG_H] = SOPHIAUPDATE(NET,GRAD,AVG_G,AVG_H,HESS_EST,
+%   HESS_UPDATE_H,ITER) updates the learnable parameters of the dlnetwork
+%   NET using the Sophia (Second-order Clipped Stochastic Optimization with
+%   diagonal Hessian pre-conditioning) algorithm. Sophia improves upon Adam
+%   by adapting step sizes to heterogeneous curvatures using a diagonal
+%   Hessian estimate and per-coordinate clipping.
 %
 %   Input GRAD contains the gradients of the loss with respect to each of
 %   the network parameters. Inputs AVG_G and AVG_H contain the moving
@@ -82,8 +82,8 @@ function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, ...
 %     BETA2        = 0.99   (Hessian EMA decay)
 %     BATCHSIZE    = 1      (tokens per update)
 %     RHO          = 0.04   (clipping threshold)
-%     WEIGHT_DECAY = 0.1    (decoupled weight decay)
-%     EPSILON      = 1e-15  (numerical stability)
+%     WEIGHT_DECAY = 0.0    (decoupled weight decay)
+%     EPSILON      = 1e-8   (numerical stability)
 %
 %   Example:
 %      % Perform Sophia updates with Hessian estimation every 10 steps.
@@ -129,12 +129,12 @@ arguments
     beta2        (1,1) {mustBeNumeric, mustBeGreaterThanOrEqual(beta2,0), mustBeLessThan(beta2,1)} = 0.99;
     bs           (1,1) {mustBeNumeric, mustBePositive} = 1;
     rho          (1,1) {mustBeNumeric, mustBePositive} = 0.04;
-    weight_decay (1,1) {mustBeNumeric, mustBeFinite, mustBeNonnegative} = 0.1;
-    epsilon      (1,1) {mustBeNumeric, mustBeFinite, mustBePositive} = 1e-15;
+    weight_decay (1,1) {mustBeNumeric, mustBeFinite, mustBeNonnegative} = 0.8;
+    epsilon      (1,1) {mustBeNumeric, mustBeFinite, mustBePositive} = 1e-8;
 end
 
 % Ensure inputs are dlarray where necessary
-if isnumeric(g)
+if isnumeric(g) && isdlarray(p)
     g = dlarray(g);
 end
 
@@ -144,9 +144,12 @@ if isempty(avg_g)
     avg_g = dlupdate(@(x) zeros(size(x), 'like', x), g);
 end
 if isempty(avg_hess)
-    avg_hess = dlupdate(@(x) zeros(size(x), 'like', x), g);
+    avg_hess = dlupdate(@(x) -ones(size(x), 'like', x), g);
 end
 if isempty(hess_est)
+    if update_hess
+        error('sophiaupdate:AVG_H cannot be empty when HESS_UPDATE is true.');
+    end
     % Create a dummy container of zeros so paramArgs structure remains constant
     hess_est = dlupdate(@(x) zeros(size(x), 'like', x), g);
 end
@@ -161,76 +164,78 @@ end
 
 % All four inputs are now guaranteed to be containers of the same structure
 paramArgs = {g, matlab.lang.internal.move(avg_g), matlab.lang.internal.move(avg_hess), hess_est};
-fixedArgs = {update_hess, t, bs, lr, beta1, beta2, rho, weight_decay, epsilon};
+fixedArgs = {update_hess, t, lr, beta1, beta2, rho, bs, weight_decay, epsilon};
 
 % Apply update over network/structure
-[p, avg_g, avg_hess] = deep.internal.networkContainerFixedArgsFun( ...
+[p, ~, avg_g, avg_hess, ~] = deep.internal.networkContainerFixedArgsFun( ...
     func, p, matlab.lang.internal.move(paramArgs), fixedArgs);
 
 end
 
-function [p, avg_g, avg_hess] = iSingleStepParameter(p, g, avg_g, avg_hess, ...
-    hess_est, update_hess, t, bs, lr, beta1, beta2, rho, weight_decay, epsilon)
+function [p, g, avg_g, avg_hess, hess_est] = iSingleStepParameter(p, g, avg_g, avg_hess, ...
+    hess_est, update_hess, t, lr, beta1, beta2, rho, bs, weight_decay, epsilon)
 % Update logic for dlnetwork parameters (Learnables table)
 
 % Apply per-parameter learn-rate factor
-lr_adj = lr * p.LearnRateFactor;
+lr = lr * p.LearnRateFactor;
 
 % Apply Weight Decay
-p.Value = p.Value .* (1 - lr_adj * weight_decay);
+p.Value = p.Value .* (1 - lr * weight_decay);
 
-% Bias correction for gradient EMA
-biasCorrection = 1 - beta1^t;
-effectiveLR = lr_adj / biasCorrection;
+% Apply a correction factor due to the trailing averages being biased
+% towards zero at the beginning.  This is fed into the clipping threshold.
+biasCorrection = (1-beta1.^t)./(1-beta2.^t);
+effectiveRho = biasCorrection.*rho;
 
 v = p.Value;
 p.Value = []; % Clear to save memory during internal update
 [v, avg_g, avg_hess] = internal_sophia(v, g, avg_g, avg_hess, hess_est, ...
-    effectiveLR, beta1, beta2, rho, bs, epsilon, update_hess);
+    lr, beta1, beta2, effectiveRho, bs, epsilon, update_hess);
 p.Value = v;
 end
 
-function [p, avg_g, avg_hess] = iSingleStepValue(p, g, avg_g, avg_hess, ...
-    hess_est, update_hess, t, bs, lr, beta1, beta2, rho, weight_decay, epsilon)
+function [p, g, avg_g, avg_hess, hess_est] = iSingleStepValue(p, g, avg_g, avg_hess, ...
+    hess_est, update_hess, t, lr, beta1, beta2, rho, bs, weight_decay, epsilon)
 % Update logic for raw dlarrays or numeric arrays
 
 % Apply Weight Decay using base LR
 p = p .* (1 - lr * weight_decay);
 
-% Bias correction for gradient EMA
-biasCorrection = 1 - beta1^t;
-effectiveLR = lr / biasCorrection;
+% Apply a correction factor due to the trailing averages being biased
+% towards zero at the beginning.  This is fed into the clipping threshold.
+biasCorrection = (1-beta1.^t)./(1-beta2.^t);
+effectiveRho = biasCorrection.*rho;
 
 [p, avg_g, avg_hess] = internal_sophia(p, g, avg_g, avg_hess, hess_est, ...
-    effectiveLR, beta1, beta2, rho, bs, epsilon, update_hess);
+    lr, beta1, beta2, effectiveRho, bs, epsilon, update_hess);
 end
 
 function [l, avg_g, avg_hess] = internal_sophia(l, g, avg_g, avg_hess, hess_est, ...
-    effectiveLR, beta1, beta2, rho, bs, epsilon, update_hess)
+    lr, beta1, beta2, rho, bs, epsilon, update_hess)
 %INTERNAL_SOPHIA Internal helper that applies one Sophia optimizer step.
 %
 %   Applies one complete Sophia update step, delegating to sophiastep for
 %   the gradient-EMA / Hessian-EMA / clipping logic.
 %   Matches the internal_adam.m pattern: skips update when LEARNRATE == 0.
 
-if effectiveLR ~= 0
+if lr ~= 0
     [step, avg_g, avg_hess] = sophiastep(g, avg_g, avg_hess, hess_est, ...
-    effectiveLR, beta1, beta2, rho, bs, epsilon, update_hess);
+    lr, beta1, beta2, rho, bs, epsilon, update_hess);
     
-    l = l + step;
+    l = l + step; % Add the step for Gradient Descent
 end
 end
 
 
 function [step, avg_g, avg_hess] = sophiastep(g, avg_g, avg_hess, hess_est, ...
-    lr, beta1, beta2, rho, bs, eps, update_hess)
+    learnrate, beta1, beta2, rho, bs, eps, update_hess)
 %SOPHIASTEP Calculate Sophia update step for a single parameter tensor.
 %
-%   [STEP,AVG_G,AVG_H] = SOPHIASTEP(GRAD,AVG_G,AVG_H,HESS,LEARNRATE,BETA1,
-%   BETA2,RHO,BATCHSIZE,EPSILON,UPDATE_H) computes the parameter update step
-%   using the Sophia algorithm. Sophia uses a diagonal Hessian-based 
-%   pre-conditioner with per-coordinate clipping to adapt step sizes to 
-%   heterogeneous curvatures across parameter dimensions.
+%   [STEP,AVG_G,AVG_H] = SOPHIASTEP(GRAD,AVG_G,AVG_H,HESS,LEARNRATE,
+%   BETA1,BETA2,RHO,BATCHSIZE,EPSILON,UPDATE_H) computes the parameter
+%   update step using the Sophia algorithm. Sophia uses a diagonal
+%   Hessian-based pre-conditioner with per-coordinate clipping to adapt
+%   step sizes to heterogeneous curvatures across parameter dimensions.
 %
 %   Input GRAD is the current gradient. Inputs AVG_G and AVG_H contain the
 %   running exponential moving averages of gradients and diagonal Hessian
@@ -249,34 +254,23 @@ function [step, avg_g, avg_hess] = sophiastep(g, avg_g, avg_hess, hess_est, ...
 %   stability. Input UPDATE_H is a logical flag; set to TRUE to update the
 %   Hessian EMA with HESS, FALSE otherwise.
 %
-%   The update equations are:
-%     m_t    = beta1 * m_{t-1} + (1 - beta1) * g_t
-%     h_t    = beta2 * h_{t-1} + (1 - beta2) * hess_est_t
-%     ratio  = min( |m_t| / (rho * batchsize * h_t + epsilon), 1 )
-%     step   = -learnrate * sign(m_t) * ratio
-%
 %   Outputs STEP is the computed parameter update. Outputs AVG_G and AVG_H
 %   are the updated gradient and Hessian EMAs, respectively.
 %
 %   See also SOPHIAUPDATE, ADAMSTEP
 
-% 1. Gradient EMA (Momentum)
-avg_g = beta1 * avg_g + (1 - beta1) * g;
+% 1. Gradient EMA
+avg_g = beta1.*avg_g + (1 - beta1).*g;
 
-% 2. Hessian EMA (Diagonal)
+% 2. Hessian EMA
 if update_hess
-    % First update check: if avg_hess is all zeros, initialize with hess_est
-    if isequal(extractdata(gather(avg_hess)), 0)
-        avg_hess = hess_est;
-    else
-        avg_hess = beta2 * avg_hess + (1 - beta2) * hess_est;
-    end
+    % Use unbiased start trick: if <0, start at current estimate
+    isFirst = all(avg_hess < 0);
+    avg_hess = isFirst.*hess_est + (1 - isFirst).*(beta2.*avg_hess + (1 - beta2).*hess_est);
 end
 
-% 3. Pre-conditioned Clipping Update
-% Equation: step = -lr * sign(avg_g) * min( |avg_g| / (rho * bs * avg_hess + eps), 1 )
-denom = rho * bs * avg_hess + eps;
-ratio = min(abs(avg_g) ./ denom, 1);
-step = - lr * sign(avg_g) .* ratio;
-
+% 3. Sophia Step
+denom = rho.*bs.*avg_hess + eps;
+ratio = min(abs(avg_g)./denom, 1);
+step = -learnrate.*sign(avg_g).*ratio;
 end

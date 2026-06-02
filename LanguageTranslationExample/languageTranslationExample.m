@@ -3,6 +3,14 @@
 % using a recurrent sequence-to-sequence encoder-decoder model with
 % attention
 
+% Detect execution environment
+executionEnvironment = "auto";
+if (executionEnvironment == "auto" && canUseGPU) || executionEnvironment == "gpu"
+    env = "gpu";
+else
+    env = "cpu";
+end
+
 
 %% Load Training Data
 
@@ -113,11 +121,12 @@ adsTarget = arrayDatastore(documentsEnglish);
 cds = combine(adsSource,adsTarget);
 
 % Create a mini-batch queue to automatically prepare mini-batches for training.
-mbq = minibatchqueue(cds,4, ...
-    MiniBatchSize=miniBatchSize, ...
-    MiniBatchFcn=@(X,Y) preprocessMiniBatch(X,Y,encGerman,encEnglish), ...
-    MiniBatchFormat=["CTB" "CTB" "CTB" "CTB"], ...
-    PartialMiniBatch="discard");
+mbq = minibatchqueue(cds, 4, ...
+    "OutputEnvironment", env, ... % Move data to GPU automatically
+    "MiniBatchSize", miniBatchSize, ...
+    "MiniBatchFcn", @(X,Y) preprocessMiniBatch(X,Y,encGerman,encEnglish), ...
+    "MiniBatchFormat", ["CTB" "CTB" "CTB" "CTB"], ...
+    "PartialMiniBatch", "discard");
 
 % Initialize the training progress plot.
 figure
@@ -514,30 +523,25 @@ end
 % array of probabilities and T is encoded as a sequence of integer values.
 
 function loss = sparseCrossEntropy(Y,T,maskT)
-
-% Initialize loss.
-[~,miniBatchSize,sequenceLength] = size(Y);
-loss = zeros([miniBatchSize sequenceLength],"like",Y);
+[numClasses, miniBatchSize, sequenceLength] = size(Y);
 
 % To prevent calculating log of 0, bound away from zero.
 precision = underlyingType(Y);
-Y(Y < eps(precision)) = eps(precision);
+Y = max(Y, eps(precision));
 
-% Loop over time steps.
-for n = 1:miniBatchSize
-    for t = 1:sequenceLength
-        idx = T(1,n,t);
-        loss(n,t) = -log(Y(idx,n,t));
-    end
-end
+% Vectorized indexing: Extract the logit corresponding to the target class
+% Y is [numClasses, miniBatchSize, seqLen], T is [1, miniBatchSize, seqLen]
+T_indices = reshape(extractdata(T), 1, []);
+offsets = (0:miniBatchSize*sequenceLength-1) * numClasses;
+linearIndices = uint32(T_indices + offsets);
 
-% Apply masking.
-maskT = squeeze(maskT);
-loss = loss .* maskT;
+Y_flat = reshape(Y, [], 1);
+loss = -log(Y_flat(linearIndices));
 
-% Calculate sum and normalize.
-loss = sum(loss,"all");
-loss = loss / miniBatchSize;
+% Reshape and apply mask
+loss = reshape(loss, miniBatchSize, sequenceLength);
+loss = loss .* squeeze(maskT);
+loss = sum(loss, "all") / miniBatchSize;
 
 end
 
