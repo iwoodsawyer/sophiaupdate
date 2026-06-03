@@ -76,7 +76,7 @@ function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, hess_est,...
 %   [___] = SOPHIAUPDATE(___,LEARNRATE,BETA1,BETA2,RHO,BATCHSIZE,
 %   WEIGHT_DECAY,EPSILON) specifies a small constant used to prevent
 %   division by zero in the update equation. The default value of EPSILON
-%   is 1e-15.
+%   is 1e-12.
 %
 %   Default values:
 %     LEARNRATE    = 1e-4
@@ -94,22 +94,26 @@ function [p, avg_g, avg_hess] = sophiaupdate(p, g, avg_g, avg_hess, hess_est,...
 %      avg_h = [];
 %      hess_interval = 10;
 %      lr = 3e-4;
-%
+%      
+%      iter_hess = 0;
 %      for iter = 1:50
-%          do_hess = (mod(iter, hess_interval) == 0);
+%          do_hess = (iter == 1) || (mod(iter, hess_interval) == 0);
 %
 %          % Compute gradients and Hessian estimate (if needed)
 %          [loss, grad] = dlfeval(@modelGradients, model, X, Y);
 %
 %          hess = [];
 %          if do_hess
+%              iter_hess = iter_hess + 1;
+%
 %              [~, grad_sampled] = dlfeval(@sampledGradients, model, X);
 %              hess = 480 * 1024 .* grad_sampled .* grad_sampled;
 %          end
 %
 %          % Update parameters
 %          [p, avg_g, avg_h] = sophiaupdate(p, grad, avg_g, avg_h, ...
-%              hess, do_hess, iter, lr, 0.965, 0.99, 491520, 0.04, 0.1, 1e-15);
+%              hess, do_hess, iter, iter_hess, lr, 0.965, 0.99, 0.04, ...
+%              491520, 0.1, 1e-15);
 %      end
 %
 %   Reference:
@@ -151,7 +155,7 @@ if isempty(avg_hess)
 end
 if isempty(hess_est)
     if update_hess
-        error('sophiaupdate:AVG_H cannot be empty when HESS_UPDATE is true.');
+        error('sophiaupdate:HESS_EST cannot be empty when HESS_UPDATE is true.');
     end
     % Create a dummy container of zeros so paramArgs structure remains constant
     hess_est = dlupdate(@(x) zeros(size(x), 'like', x), g);
@@ -231,7 +235,7 @@ end
 
 
 function [step, avg_g, avg_hess] = sophiastep(g, avg_g, avg_hess, hess_est, ...
-    learnrate, beta1, beta2, rho, bs, eps, update_hess)
+    learnrate, beta1, beta2, rho, bs, epsilon, update_hess)
 %SOPHIASTEP Calculate Sophia update step for a single parameter tensor.
 %
 %   [STEP,AVG_G,AVG_H] = SOPHIASTEP(GRAD,AVG_G,AVG_H,HESS,LEARNRATE,
@@ -273,7 +277,7 @@ if update_hess
 end
 
 % 3. Sophia Step
-denom = rho.*bs.*avg_hess + eps;
+denom = rho.*bs.*max(avg_hess, 0) + epsilon;
 ratio = min(abs(avg_g)./denom, 1);
 step = -learnrate.*sign(avg_g).*ratio;
 end
