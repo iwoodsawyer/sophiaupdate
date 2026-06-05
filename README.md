@@ -33,6 +33,7 @@ avg_hess = [];
 bs       = batch_size * seq_len;   % effective token count
 hess_interval = 10;
 
+k = 0;
 for t = 1:max_iters
     do_hess = (mod(t, hess_interval) == 0) || (t == 1);
 
@@ -40,11 +41,12 @@ for t = 1:max_iters
 
     hess_est = [];
     if do_hess
+	    k = k + 1; 
         [~, g_sampled] = dlfeval(@sampledGradients, model, X);
         hess_est = bs .* g_sampled .* g_sampled;   % GNB estimator
     end
 
     [model, avg_g, avg_hess] = sophiaupdate( ...
         model, g, avg_g, avg_hess, hess_est, do_hess, t, ...
-        3e-4, 0.965, 0.99, bs, 0.04, 0.1, 1e-15);
+        k, 3e-4, 0.965, 0.99, 0.04, bs, 0.1, 1e-15);
 end
